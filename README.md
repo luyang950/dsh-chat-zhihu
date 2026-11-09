@@ -13,8 +13,9 @@
 ### 特性
 
 - **长在会话里**：卡片是一个自定义 chat node，位置就是 `/zhihu` 那一轮；`/zhihu` 这行命令本身不显示。
-- **伪装成普通回复**：没有知乎配色和头像，问题标题像回复的小标题，作者和赞同数是一行小字，正文按段落排版；字号默认跟随会话字号。没有标题栏；鼠标移入时右下角浮出一个小按钮条（快捷键说明在它的悬停提示里），不遮挡正文。
-- **图片默认不显示**（最容易露馅），只留一个小小的「［图］」，可在设置里打开。
+- **伪装成普通回复**：没有知乎配色和头像，问题标题像回复的小标题，作者和赞同数是一行小字，正文按段落排版；字号默认跟随会话字号。没有标题栏；鼠标移入时左下角浮出一个小按钮条（快捷键说明在它的悬停提示里），不遮挡正文。
+- **图片默认不显示**（最容易露馅），只留一个小小的「［图］」：点它展开这一张，再点图片收起。设置里可以改成默认显示。
+- **复制原文链接**：按钮条里的「复制链接」复制当前顶部那条回答（或这篇专栏）的知乎链接。
 - **零 token**：`/zhihu` 只产生两条只写日志的事件（`command/run` / `command/done`），结果只是一个目标（热榜 / 问题 id / 回答 id / 文章 id），不伪造 assistant 消息。
 - **不顶动历史**：卡片高度 = 会话可视高度 − 输入框高度，内容在卡片内部滚动，往下滚到底自动加载更多回答。
 - **老板键**（默认 `Ctrl + Alt + Z`，可在设置里改；和 dsh-chat-reader 的 `Ctrl + Alt + B` 不冲突）：按一次所有知乎卡片折叠成一行 `···`，内容**从 DOM 移除**，后台的知乎网页也一并关掉；再按恢复。刷新后保持。
@@ -58,7 +59,8 @@
 
 - **热榜**由插件宿主侧请求知乎的公开热榜接口（不需要登录），缓存 1 分钟。
 - **推荐 / 问题 / 回答**：都需要登录。插件在 DSH 桌面版里通过 `window.dshDesktop.browser`（DSH 自带侧栏浏览器用的同一个桥）租用一个**隐藏的 `<webview>`**，停在一个很轻的 `www.zhihu.com` 页面（`robots.txt`）上，带着你的登录态调用知乎网页版自己用的接口：推荐流 `/api/v3/feed/topstory/recommend`、问题的回答列表 `/api/v4/questions/{id}/answers`、单个回答 `/api/v4/answers/{id}`。这几个接口只要登录、不需要签名；id 都是字符串，19 位 id 不会丢精度。推荐里每条自带完整正文，点开不用再请求。翻页只跟随知乎返回的、指向 `www.zhihu.com/api/` 的下一页地址。
-- **专栏文章**的接口需要签名，所以改为在隐藏网页里打开文章页，读页面自带的数据（`js-initialData`）。上面几个接口如果哪天被拒，也会自动退回到打开页面读取的方式。
+- **专栏文章**的接口需要签名，所以改为在隐藏网页里打开文章页，读页面自带的数据（`js-initialData`）。上面几个接口如果被拒（比如知乎返回 10003「请升级客户端」），也会自动退回到打开页面读取的方式：加载更多回答时改为打开问题页，之后由知乎页面自己的脚本继续加载。插件不会伪造签名。
+- 隐藏网页的 UA 用 DSH 自带 Chromium 的真实版本，只去掉 `Electron/…` 和应用名标记。
 - 无论哪条路，正文 HTML 都会先**转换成纯文本段落**再显示——知乎的 HTML 从不插进 DSH 页面。
 - 隐藏网页运行在 DSH 的沙箱分区里（无 Node、contextIsolation、禁权限请求），和 DSH 自带浏览器的隔离策略一致。
 
@@ -123,7 +125,8 @@ Read Zhihu **inside the DeepSeek Harness conversation transcript**, disguised as
 - **The feed, questions, answers and articles need DSH Desktop**: Zhihu shows them only to a signed-in browser, so the card leases one hidden `<webview>` through `window.dshDesktop.browser` (the bridge DSH's own sidebar browser uses), opens the page there and reads the page's own data. Zhihu's HTML is converted to plain text blocks by a small parser and never injected.
 - **Sign in** inside the card (QR code; lasts until the app quits) or paste your Zhihu cookie (with `z_c0`) in Settings → 知乎 so it survives restarts. The cookie is stored only in `$DSH_HOME/dsh-chat-zhihu/cookie.json` (mode 600).
 - **Boss key** `Ctrl + Alt + Z` (configurable) folds every card to `···`, removes the text from the DOM and closes the hidden webview.
-- Images are off by default; settings: font size, line height, images, boss key, keep-in-sidebar, session title.
+- Images are off by default (click ［图］ to open one, click it again to fold it); the corner pill copies the original Zhihu link. Settings: font size, line height, images, boss key, keep-in-sidebar, session title.
+- When Zhihu refuses an API call (e.g. code 10003), the card falls back to reading the page; it never forges request signatures.
 
 Install on Desktop: **Plugins** → GitHub spec `github:luyang950/dsh-chat-zhihu`, then restart.
 

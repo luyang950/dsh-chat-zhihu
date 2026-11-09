@@ -338,7 +338,64 @@ test('a question card shows its position in the pill', () => {
   const parts = walkTree(pill.children)
   assert.equal(parts.find((node) => node.props && node.props.className === 'dczPos').children.join(''), '1/311')
   const labels = parts.filter((node) => node.type === 'button').map((node) => node.children.join(''))
-  assert.deepEqual(labels, ['推荐', '热榜', '下一个', '刷新', '合上'])
+  assert.deepEqual(labels, ['推荐', '热榜', '下一个', '复制链接', '刷新', '合上'])
+})
+
+test('images start as the setting says, and a click opens or folds each one', () => {
+  const loaded = mount()
+  const { plugin } = loaded
+  const card = loaded.slots.find((slot) => slot.options.name === 'conversation.chat.node').component
+  plugin.shared.boss = false
+  plugin.shared.pages.set('question:6', {
+    status: 'ready',
+    question: { id: '6', title: 'Q', answerCount: 1 },
+    answers: [{ id: '1', author: '甲', html: '<p>看图</p><figure><img src="https://pic1.zhimg.com/v2-a_720w.jpg"></figure>' }],
+  })
+  const tree = walkTree(card({ node: { key: 'n3', data: { status: 'ready', target: { kind: 'question', id: '6' } } } }))
+  const image = tree.find((node) => typeof node.type === 'function' && node.type.name === 'ZhihuImage')
+  assert.ok(image, 'images render through ZhihuImage')
+  assert.equal(image.props.shown, false, 'images are folded by default')
+  assert.equal(image.props.src, 'https://pic1.zhimg.com/v2-a_720w.jpg')
+  const folded = image.type({ src: image.props.src, shown: false })
+  assert.equal(folded.props.className, 'dczImg')
+  assert.equal(folded.children.join(''), '［图］')
+  assert.equal(typeof folded.props.onClick, 'function', 'the placeholder opens the image')
+  const open = image.type({ src: image.props.src, shown: true })
+  assert.equal(open.type, 'img')
+  assert.equal(open.props.referrerPolicy, 'no-referrer')
+  assert.equal(typeof open.props.onClick, 'function', 'a shown image folds back on click')
+})
+
+test('复制链接 copies the answer at the top, the article, or the list', () => {
+  const { plugin } = loadBundle()
+  const page = { status: 'ready', question: { id: '5' }, answers: [{ id: '11' }, { id: '12' }] }
+  assert.equal(plugin.linkOf({ kind: 'question', id: '5' }, page, 1), 'https://www.zhihu.com/question/5/answer/12')
+  assert.equal(plugin.linkOf({ kind: 'question', id: '5' }, page, 9), 'https://www.zhihu.com/question/5/answer/12', 'clamped to the last answer')
+  assert.equal(plugin.linkOf({ kind: 'question', id: '5' }, { status: 'ready', question: { id: '5' }, answers: [] }, 0), 'https://www.zhihu.com/question/5')
+  assert.equal(plugin.linkOf({ kind: 'article', id: '7' }, { status: 'ready', article: { id: '7' } }, 0), 'https://zhuanlan.zhihu.com/p/7')
+  assert.equal(plugin.linkOf({ kind: 'hot' }, { status: 'ready' }, 0), 'https://www.zhihu.com/hot')
+  // An answer opened by link still lists from its question's page.
+  assert.deepEqual(plain(plugin.questionPageOf({ kind: 'question', id: '5', answer: '11' }, page)), { kind: 'question', id: '5' })
+  assert.deepEqual(plain(plugin.questionPageOf({ kind: 'answer', id: '11' }, page)), { kind: 'question', id: '5' })
+  assert.deepEqual(plain(plugin.questionPageOf({ kind: 'answer', id: '11' }, {})), { kind: 'answer', id: '11' })
+})
+
+test("the hidden webview's user agent is DSH's own, minus the app's tokens", () => {
+  const { plugin } = loadBundle()
+  const ua =
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) DeepSeekHarness/0.2.4 Chrome/138.0.7204.251 Electron/37.6.0 Safari/537.36'
+  assert.equal(
+    plugin.guestUserAgent(ua),
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.7204.251 Safari/537.36',
+  )
+  assert.equal(
+    plugin.guestUserAgent(
+      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) @deepseek-ai/dsh-desktop/0.2.2-rc.1 Chrome/146.0.7680.65 Electron/44.7.0 Safari/537.36',
+    ),
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.7680.65 Safari/537.36',
+    'an app name with slashes goes too',
+  )
+  assert.equal(plugin.guestUserAgent('curl/8.0'), '', 'nothing usable: leave the webview default')
 })
 
 /* ── boss key ────────────────────────────────────────────────────────────── */
@@ -613,9 +670,13 @@ test('API script: paging only follows Zhihu API links; 401 is a login wall; othe
   assert.equal(result.end, true)
   assert.deepEqual((await runApi(plugin, { kind: 'feed' }, { '/api/v3/': [401, { error: { message: 'x' } }] })).result, { blocked: true })
   assert.deepEqual((await runApi(plugin, { kind: 'answer', id: '1' }, { '/api/v4/': [403, { error: { need_login: true } }] })).result, { blocked: true })
-  assert.deepEqual((await runApi(plugin, { kind: 'answers', id: '1' }, { '/api/v4/': [403, { error: { message: '请求参数异常' } }] })).result, {
-    error: '请求参数异常',
+  assert.deepEqual((await runApi(plugin, { kind: 'answers', id: '1' }, { '/api/v4/': [403, { error: { message: '内容已删除' } }] })).result, {
+    error: '内容已删除',
+    code: 403,
   })
+  // Zhihu's "请升级客户端后重试" (10003) means "signed request wanted": say that instead.
+  const refused = (await runApi(plugin, { kind: 'answers', id: '1' }, { '/api/v4/': [403, { error: { code: 10003, message: '请求参数异常，请升级客户端后重试。' } }] })).result
+  assert.deepEqual(refused, { error: '知乎没让插件直接加载这部分（10003）', code: 10003 })
   assert.deepEqual((await runApi(plugin, { kind: 'answers', id: '1/../x' }, {})).result, { error: '问题 id 不对' })
 })
 
