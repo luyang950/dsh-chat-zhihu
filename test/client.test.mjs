@@ -337,13 +337,20 @@ function feedCard({ href, title, zop, votes, excerpt, className = 'Card Topstory
   return element({ className, find: { '.ContentItem': content, '.ContentItem-title a[href]': link } })
 }
 
-function runGuest(plugin, op, { pathname, hostname = 'www.zhihu.com', state, readyState = 'complete', cards = [] }) {
+function runGuest(plugin, op, { pathname, hostname = 'www.zhihu.com', state, readyState = 'complete', cards = [], main = null }) {
   const cookies = []
   const document = {
     readyState,
     title: 't',
+    visibilityState: 'visible',
+    body: main,
     getElementById: (id) => (id === 'js-initialData' && state ? { textContent: JSON.stringify({ initialState: state }) } : null),
-    querySelector: (selector) => (cards.length > 0 && /TopstoryItem|Feed/.test(selector) ? cards[0] : null),
+    querySelector: (selector) => {
+      if (cards.length > 0 && /TopstoryItem|Feed/.test(selector)) return cards[0]
+      if (main && /main/.test(selector)) return main
+      if (main && /answer/.test(selector)) return main
+      return null
+    },
     querySelectorAll: (selector) => (selector === '.TopstoryItem' ? cards : []),
     documentElement: { scrollHeight: 0 },
     set cookie(value) {
@@ -437,6 +444,40 @@ test('guest script: reads the home feed with exact ids, skipping ads and cards w
   assert.deepEqual(data.items[1].target, { kind: 'article', id: '42' })
   assert.equal(data.items[1].excerpt.length, 160)
   assert.equal(data.items[1].votes, null)
+})
+
+test('guest script: with unfamiliar card markup the feed falls back to links in the main column', async () => {
+  const { plugin } = loadBundle()
+  const link = (href, text, boxText) =>
+    Object.assign(element({ attrs: { href }, text }), {
+      closest: () => (boxText ? element({ text: boxText }) : null),
+      parentElement: null,
+    })
+  const links = [
+    link('/question/2102992165089579738/answer/2103000000000000001', '一个问题的标题', '一个问题的标题 甲：这是摘要… 阅读全文'),
+    link('https://zhuanlan.zhihu.com/p/42', '一篇专栏', null),
+    link('/question/5', '短', null),
+    link('/people/someone', '某人的主页', null),
+  ]
+  const main = { querySelectorAll: () => links }
+  const data = plain(await runGuest(plugin, { action: 'extract' }, { pathname: '/', main }).result)
+  assert.deepEqual(
+    data.items.map((item) => [item.target, item.title, item.excerpt]),
+    [
+      [{ kind: 'question', id: '2102992165089579738', answer: '2103000000000000001' }, '一个问题的标题', '甲：这是摘要…'],
+      [{ kind: 'article', id: '42' }, '一篇专栏', ''],
+    ],
+  )
+  assert.equal(data.debug.path, '/')
+  assert.equal(data.debug.topstoryItem, 0)
+})
+
+test('an empty feed explains what the page looked like', () => {
+  const { plugin } = loadBundle()
+  assert.throws(
+    () => plugin.applyResult('feed', { kind: 'feed', items: [], debug: { path: '/', topstoryItem: 0, visibility: 'hidden' } }, false),
+    /诊断：path=\/ · topstoryItem=0 · visibility=hidden/,
+  )
 })
 
 test('feed entries merge without duplicates; a refreshed empty feed is an error, a stalled one ends', () => {
