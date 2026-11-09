@@ -1,0 +1,391 @@
+// The browser bundle's loader contract: one ModuleLoader registration, only `react`
+// required, the declared services are the only ones touched, the `/zhihu` lifecycle
+// folds into one card node, Zhihu HTML becomes plain blocks, and the guest script
+// reads Zhihu's page data on its own.
+
+import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
+import test from 'node:test'
+import { runInNewContext } from 'node:vm'
+
+const SOURCE = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8')
+
+const REACT_STUB = {
+  createElement: (type, props, ...children) => ({ type, props, children }),
+  memo: (component) => component,
+  Fragment: 'fragment',
+  useState: (initial) => [typeof initial === 'function' ? initial() : initial, () => {}],
+  useReducer: (reducer, initial) => [initial, () => {}],
+  useEffect: () => {},
+  useLayoutEffect: () => {},
+  useRef: (initial) => ({ current: initial }),
+  useSyncExternalStore: (subscribe, get) => get(),
+}
+
+function makeWindow() {
+  const listeners = []
+  return {
+    listeners,
+    addEventListener: (type, fn, capture) => listeners.push({ type, fn, capture }),
+    removeEventListener: (type, fn) => {
+      const at = listeners.findIndex((entry) => entry.type === type && entry.fn === fn)
+      if (at >= 0) listeners.splice(at, 1)
+    },
+  }
+}
+
+function loadBundle({ fetch, storage } = {}) {
+  const registrations = []
+  const window = makeWindow()
+  window.__ModuleLoader__ = { load: (registration) => registrations.push(registration) }
+  const required = []
+  const items = new Map(Object.entries(storage || {}))
+  const sandbox = {
+    window,
+    document: { createElement: () => ({ dataset: {}, remove() {} }), head: { append() {} } },
+    fetch: fetch || (() => Promise.reject(new Error('network disabled in tests'))),
+    localStorage: {
+      getItem: (key) => (items.has(key) ? items.get(key) : null),
+      setItem: (key, value) => items.set(key, String(value)),
+      removeItem: (key) => items.delete(key),
+    },
+    setTimeout,
+    clearTimeout,
+    console,
+    URL,
+  }
+  sandbox.globalThis = sandbox
+  runInNewContext(SOURCE, sandbox, { filename: 'lib/client.js' })
+  assert.equal(registrations.length, 1)
+  const plugin = registrations[0].factory((id) => {
+    required.push(id)
+    return REACT_STUB
+  })
+  return { registration: registrations[0], plugin, required, window, sandbox, items }
+}
+
+function mount(options) {
+  const loaded = loadBundle(options)
+  const effects = []
+  const definitions = []
+  const slots = []
+  const ctx = {
+    effect: (run, label) => effects.push({ run, label }),
+    uiConversation: { events: { register: (definition) => (definitions.push(definition), () => {}) } },
+    slots: {
+      inject: (key, run) => run(),
+      register: (options, component) => (slots.push({ options, component }), () => {}),
+    },
+  }
+  loaded.plugin.apply(ctx)
+  const disposers = effects.map((effect) => effect.run())
+  return Object.assign(loaded, { effects, definitions, slots, disposers })
+}
+
+/** Replay a command lifecycle the way the conversation assembler does. */
+function fold(definition, run, done) {
+  const startMatch = definition.match({ type: 'command/run', seq: 11, time: run.time, data: run })
+  if (startMatch === null) return { startMatch, node: null }
+  const startEvent = { type: 'command/run', seq: 11, time: run.time, data: run }
+  const start = { event: startEvent, role: 'start', location: { turn: 2, step: 0 } }
+  let context = { key: `${definition.kind}:${startMatch.id}`, id: startMatch.id, start, state: undefined }
+  context.state = definition.start(context, start)
+  if (done) {
+    const updateMatch = definition.match({ type: 'command/done', seq: 12, data: done })
+    if (updateMatch && updateMatch.id === startMatch.id) {
+      context = Object.assign({}, context, { state: definition.update(context, { event: { type: 'command/done', seq: 12, data: done } }) })
+    }
+  }
+  return { startMatch, node: definition.buildViewNode(context) }
+}
+
+/** Strip vm-realm prototypes so deepEqual compares structure only. */
+const plain = (value) => JSON.parse(JSON.stringify(value))
+
+/* ── loader contract ─────────────────────────────────────────────────────── */
+
+test('one ModuleLoader registration under the package id; only react is required', () => {
+  const { registration, plugin, required } = loadBundle()
+  assert.equal(registration.id, 'dsh-chat-zhihu')
+  assert.deepEqual([...new Set(required)], ['react'])
+  assert.equal(plugin.name, 'dsh-chat-zhihu')
+})
+
+test('every ctx.<service> the bundle touches is declared in inject', () => {
+  const { plugin } = loadBundle()
+  assert.deepEqual([...plugin.inject].sort(), ['slots', 'uiConversation'])
+  const builtins = new Set(['effect', 'inject', 'get', 'on', 'off', 'logger'])
+  for (const [, service] of SOURCE.matchAll(/\bctx\.([A-Za-z_$][\w$]*)/g)) {
+    if (builtins.has(service)) continue
+    assert.ok(plugin.inject.includes(service), `ctx.${service} used but not injected`)
+  }
+})
+
+test('apply registers the card node, the empty commandview, settings and one capture keydown listener', () => {
+  const { slots, definitions, window, disposers } = mount()
+  assert.equal(definitions.length, 1)
+  const names = slots.map((slot) => `${slot.options.name}:${slot.options.key || slot.options.id}`).sort()
+  assert.deepEqual(names, ['conversation.chat.commandview:zhihu', 'conversation.chat.node:dsh-chat-zhihu', 'settings.section:dsh-chat-zhihu'])
+  const commandview = slots.find((slot) => slot.options.name === 'conversation.chat.commandview')
+  assert.equal(commandview.component(), null)
+  assert.deepEqual(
+    window.listeners.map((entry) => [entry.type, entry.capture]),
+    [['keydown', true]],
+  )
+  for (const dispose of disposers) if (typeof dispose === 'function') dispose()
+  assert.equal(window.listeners.length, 0)
+})
+
+/* ── the chat node ───────────────────────────────────────────────────────── */
+
+test('/zhihu run + done fold into one card node carrying the target', () => {
+  const { plugin } = loadBundle()
+  const definition = plugin.cardDefinition
+  const { node } = fold(
+    definition,
+    { name: 'zhihu', commandId: 'c1', time: 5 },
+    { commandId: 'c1', kind: 'success', text: JSON.stringify({ target: { kind: 'question', id: '9', answer: '10' } }) },
+  )
+  assert.equal(node.kind, 'dsh-chat-zhihu')
+  assert.equal(node.anchorSeq, 11)
+  assert.deepEqual(plain(node.data), { status: 'ready', target: { kind: 'question', id: '9', answer: '10' }, error: '', time: 5 })
+})
+
+test('other commands are ignored; failures and malformed results become error cards', () => {
+  const { plugin } = loadBundle()
+  const definition = plugin.cardDefinition
+  assert.equal(fold(definition, { name: 'read', commandId: 'c2' }).startMatch, null)
+  const failed = fold(definition, { name: 'zhihu', commandId: 'c3' }, { commandId: 'c3', kind: 'error', text: '只支持 zhihu.com 的链接' })
+  assert.equal(failed.node.data.status, 'error')
+  assert.equal(failed.node.data.error, '只支持 zhihu.com 的链接')
+  const malformed = fold(definition, { name: 'zhihu', commandId: 'c4' }, { commandId: 'c4', kind: 'success', text: '{"target":{"kind":"people","id":"x"}}' })
+  assert.equal(malformed.node.data.status, 'error')
+  const pending = fold(definition, { name: 'zhihu', commandId: 'c5' })
+  assert.equal(pending.node.data.status, 'pending')
+})
+
+/* ── html → blocks ───────────────────────────────────────────────────────── */
+
+test('Zhihu rich text becomes plain blocks; scripts, noscript and foreign images are dropped', () => {
+  const { plugin } = loadBundle()
+  const html = [
+    '<p data-pid="a">第一段 <b>加粗</b> &amp; 实体&#x4E00;<br/>换行</p>',
+    '<h2>小标题</h2>',
+    '<figure data-size="normal"><noscript><img src="https://pic1.zhimg.com/dup.jpg"/></noscript>',
+    '<img src="data:image/svg+xml;utf8,&lt;svg&gt;" data-actualsrc="https://pic1.zhimg.com/v2-a_b.jpg" class="lazy"/>',
+    '<figcaption>图注</figcaption></figure>',
+    '<blockquote>引用<br>两行</blockquote>',
+    '<ul><li>甲</li><li>乙</li></ul>',
+    '<ol start="3"><li>丙<li>丁</ol>',
+    '<div class="highlight"><pre><code class="language-js">const a = 1 &lt; 2\n  return a</code></pre></div>',
+    '<p>公式 <img eeimg="1" src="https://www.zhihu.com/equation?tex=x%5E2" alt="x^2"/> 结束</p>',
+    '<p><img src="https://evil.example.com/x.png"></p>',
+    '<script>alert(1)</script><style>p{}</style>',
+    '<hr/>',
+    '<p><a class="LinkCard" data-text="链接卡片标题" href="https://example.com">x</a></p>',
+    '<table><tr><th>名</th><th>值</th></tr><tr><td>a</td><td>1</td></tr></table>',
+    '裸文字',
+  ].join('')
+  assert.deepEqual(plain(plugin.htmlToBlocks(html)), [
+    { t: 'p', text: '第一段 加粗 & 实体一\n换行' },
+    { t: 'h', text: '小标题' },
+    { t: 'img', src: 'https://pic1.zhimg.com/v2-a_b.jpg' },
+    { t: 'p', text: '图注', small: true },
+    { t: 'quote', text: '引用\n两行' },
+    { t: 'li', text: '甲', marker: '•' },
+    { t: 'li', text: '乙', marker: '•' },
+    { t: 'li', text: '丙', marker: '3.' },
+    { t: 'li', text: '丁', marker: '4.' },
+    { t: 'code', text: 'const a = 1 < 2\n  return a' },
+    { t: 'p', text: '公式 $x^2$ 结束' },
+    { t: 'hr' },
+    { t: 'p', text: '链接卡片标题' },
+    { t: 'p', text: '名 ｜ 值' },
+    { t: 'p', text: 'a ｜ 1' },
+    { t: 'p', text: '裸文字' },
+  ])
+})
+
+test('the parser survives broken markup', () => {
+  const { plugin } = loadBundle()
+  assert.deepEqual(plain(plugin.htmlToBlocks('<p>未闭合 <b>粗<p>下一段</div></span>')), [
+    { t: 'p', text: '未闭合 粗' },
+    { t: 'p', text: '下一段' },
+  ])
+  assert.deepEqual(plain(plugin.htmlToBlocks('a < b <p title="x>y">c')), [
+    { t: 'p', text: 'a < b' },
+    { t: 'p', text: 'c' },
+  ])
+  assert.deepEqual(plain(plugin.htmlToBlocks('')), [])
+  assert.equal(plugin.decodeEntities('&#0;&#x110000;&bogus;&lt;'), '&bogus;<')
+})
+
+/* ── page state ──────────────────────────────────────────────────────────── */
+
+test('answers merge by id, keep order, and prefer the longer copy', () => {
+  const { plugin } = loadBundle()
+  const merged = plugin.mergeAnswers(
+    [
+      { id: '1', html: 'short' },
+      { id: '2', html: 'b' },
+    ],
+    [
+      { id: '1', html: 'much longer' },
+      { id: '3', html: 'c' },
+      { id: '', html: 'no id' },
+    ],
+  )
+  assert.deepEqual(plain(merged), [
+    { id: '1', html: 'much longer' },
+    { id: '2', html: 'b' },
+    { id: '3', html: 'c' },
+  ])
+})
+
+test('applyResult: a login wall, a question that stops growing, an article', () => {
+  const { plugin } = loadBundle()
+  plugin.applyResult('question:1', { blocked: true }, false)
+  assert.equal(plugin.pageOf('question:1').status, 'login')
+
+  const question = { id: '1', title: 'Q', answerCount: 10 }
+  plugin.applyResult('question:1', { kind: 'question', question, answers: [{ id: 'a', html: 'x' }], end: false }, false)
+  assert.equal(plugin.pageOf('question:1').status, 'ready')
+  assert.equal(plugin.pageOf('question:1').end, false)
+  plugin.applyResult('question:1', { kind: 'question', question, answers: [{ id: 'a', html: 'x' }], end: false }, true)
+  assert.equal(plugin.pageOf('question:1').end, true, 'a load that adds nothing ends the list')
+
+  plugin.applyResult('article:2', { kind: 'article', article: { id: '2', title: 'T', html: '<p>x</p>' } }, false)
+  assert.equal(plugin.pageOf('article:2').article.title, 'T')
+  assert.throws(() => plugin.applyResult('x', { kind: 'unknown', url: 'https://www.zhihu.com/people/a' }, false), /没认出/)
+})
+
+test('formatting helpers', () => {
+  const { plugin } = loadBundle()
+  assert.equal(plugin.compactCount(999), '999')
+  assert.equal(plugin.compactCount(12345), '1.2 万')
+  assert.equal(plugin.compactCount(1234567), '123 万')
+  assert.equal(plugin.answerMeta({ author: '甲', headline: '乙', votes: 20000, comments: 3 }), '甲，乙 · 2.0 万 赞同 · 3 评论')
+  assert.equal(plugin.answerMeta({ author: '', votes: null }), '匿名用户')
+  assert.equal(plugin.lastAtOrAbove([0, 100, 200], 150), 1)
+  assert.ok(plugin.isSignedInUrl('https://www.zhihu.com/hot'))
+  assert.ok(!plugin.isSignedInUrl('https://www.zhihu.com/signin?next=%2Fhot'))
+  assert.ok(!plugin.isSignedInUrl('https://www.zhihu.com/account/unhuman?type=x'))
+  assert.ok(!plugin.isSignedInUrl('https://evil.com/'))
+  assert.ok(!plugin.isSignedInUrl('about:blank#lease'))
+})
+
+test('a stored navigation stack is restored, and junk falls back to the command target', () => {
+  const stack = { stack: [{ target: { kind: 'hot' }, scroll: 120 }, { target: { kind: 'question', id: '5' }, scroll: 'x' }, { target: { kind: 'evil' } }] }
+  const { plugin } = loadBundle({ storage: { 'dsh-chat-zhihu:nav:n1': JSON.stringify(stack), 'dsh-chat-zhihu:nav:n2': '{oops' } })
+  assert.deepEqual(plain(plugin.readNav('n1', { kind: 'hot' })), [
+    { target: { kind: 'hot' }, scroll: 120 },
+    { target: { kind: 'question', id: '5' }, scroll: 0 },
+  ])
+  assert.deepEqual(plain(plugin.readNav('n2', { kind: 'article', id: '1' })), [{ target: { kind: 'article', id: '1' }, scroll: 0 }])
+})
+
+/* ── boss key ────────────────────────────────────────────────────────────── */
+
+test('the boss key toggles only with a card on screen, and only on the exact chord', () => {
+  const { plugin } = loadBundle()
+  const press = (overrides) => {
+    let prevented = false
+    const event = Object.assign(
+      { ctrlKey: true, altKey: true, shiftKey: false, metaKey: false, code: 'KeyZ', preventDefault: () => (prevented = true), stopPropagation() {} },
+      overrides,
+    )
+    plugin.onBossKey(event)
+    return prevented
+  }
+  assert.equal(press(), false, 'no card mounted: the chord passes through')
+  plugin.shared.cards = 1
+  assert.equal(press({ code: 'KeyB' }), false)
+  assert.equal(press({ shiftKey: true }), false)
+  assert.equal(press({ isComposing: true }), false)
+  assert.equal(press(), true)
+  assert.equal(plugin.shared.boss, true)
+  plugin.shared.cards = 0
+  assert.equal(press(), true, 'hidden cards can always be brought back')
+  assert.equal(plugin.shared.boss, false)
+})
+
+/* ── the guest script ────────────────────────────────────────────────────── */
+
+function runGuest(plugin, op, { pathname, hostname = 'www.zhihu.com', state, readyState = 'complete' }) {
+  const cookies = []
+  const document = {
+    readyState,
+    title: 't',
+    getElementById: (id) => (id === 'js-initialData' && state ? { textContent: JSON.stringify({ initialState: state }) } : null),
+    querySelector: () => null,
+    querySelectorAll: () => [],
+    documentElement: { scrollHeight: 0 },
+    set cookie(value) {
+      cookies.push(value)
+    },
+  }
+  const sandbox = {
+    location: { pathname, hostname, href: `https://${hostname}${pathname}` },
+    document,
+    window: { scrollTo() {}, scrollBy() {} },
+    setTimeout,
+    JSON,
+    Number,
+    String,
+    Boolean,
+    Object,
+    Date,
+    Promise,
+    Set,
+  }
+  const result = runInNewContext(`(${plugin.zhihuGuest.toString()})(${JSON.stringify(op)})`, sandbox)
+  return { result, cookies }
+}
+
+test('guest script: probe sees the login wall and readiness', () => {
+  const { plugin } = loadBundle()
+  assert.equal(runGuest(plugin, { action: 'probe' }, { pathname: '/account/unhuman' }).result.blocked, true)
+  const ready = runGuest(plugin, { action: 'probe' }, { pathname: '/question/1', state: {} }).result
+  assert.equal(ready.blocked, false)
+  assert.equal(ready.ready, true)
+  assert.equal(runGuest(plugin, { action: 'probe' }, { pathname: '/question/1', state: {}, readyState: 'loading' }).result.ready, false)
+})
+
+test('guest script: reads a question from the page data alone', async () => {
+  const { plugin } = loadBundle()
+  const state = {
+    entities: {
+      questions: { 1: { title: '问题标题', detail: '<p>描述</p>', answerCount: 2, followerCount: 9 } },
+      answers: {
+        11: { content: '<p>回答一</p>', voteupCount: 5, author: { name: '甲', headline: 'h' }, question: { id: 1 } },
+        12: { content: '<p>回答二</p>', voteupCount: 1, author: { name: '乙' }, question: { id: 1 } },
+        99: { content: '<p>别的问题</p>', question: { id: 2 } },
+      },
+    },
+  }
+  const { result } = runGuest(plugin, { action: 'extract' }, { pathname: '/question/1', state })
+  const data = plain(await result)
+  assert.equal(data.kind, 'question')
+  assert.deepEqual(data.question, { id: '1', title: '问题标题', detail: '<p>描述</p>', answerCount: 2, followers: 9 })
+  assert.deepEqual(
+    data.answers.map((answer) => [answer.id, answer.author, answer.votes]),
+    [
+      ['11', '甲', 5],
+      ['12', '乙', 1],
+    ],
+  )
+  assert.equal(data.end, true)
+})
+
+test('guest script: reads an article, refuses unknown pages, plants cookies', async () => {
+  const { plugin } = loadBundle()
+  const state = { entities: { articles: { 7: { title: '文章', content: '<p>正文</p>', voteupCount: 3, author: { name: '丙' } } } } }
+  const article = plain(await runGuest(plugin, { action: 'extract' }, { pathname: '/p/7', hostname: 'zhuanlan.zhihu.com', state }).result)
+  assert.equal(article.kind, 'article')
+  assert.equal(article.article.title, '文章')
+  assert.equal(article.article.author, '丙')
+  const unknown = plain(await runGuest(plugin, { action: 'extract' }, { pathname: '/people/x', state: {} }).result)
+  assert.equal(unknown.kind, 'unknown')
+  const { cookies } = runGuest(plugin, { action: 'cookie', pairs: [['z_c0', 'v']] }, { pathname: '/robots.txt' })
+  assert.deepEqual(cookies, ['z_c0=v; domain=.zhihu.com; path=/; max-age=31536000; secure; samesite=lax'])
+})
