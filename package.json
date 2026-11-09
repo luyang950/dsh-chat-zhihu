@@ -1,6 +1,6 @@
 {
   "name": "dsh-chat-zhihu",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "DeepSeek Harness plugin: read Zhihu (hot list, questions, answers, articles) inside the conversation transcript, disguised as an ordinary reply, with a boss key and zero token cost.",
   "license": "MIT",
   "repository": {

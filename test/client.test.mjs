@@ -244,12 +244,15 @@ test('answers merge by id, keep order, and prefer the longer copy', () => {
 
 test('applyResult: a login wall, a question that stops growing, an article', () => {
   const { plugin } = loadBundle()
+  assert.equal(plugin.shared.login, 'unknown', 'no login button before Zhihu has said anything')
   plugin.applyResult('question:1', { blocked: true }, false)
   assert.equal(plugin.pageOf('question:1').status, 'login')
+  assert.equal(plugin.shared.login, 'out')
 
   const question = { id: '1', title: 'Q', answerCount: 10 }
   plugin.applyResult('question:1', { kind: 'question', question, answers: [{ id: 'a', html: 'x' }], end: false }, false)
   assert.equal(plugin.pageOf('question:1').status, 'ready')
+  assert.equal(plugin.shared.login, 'in', 'a page that loads means the sign-in worked')
   assert.equal(plugin.pageOf('question:1').end, false)
   plugin.applyResult('question:1', { kind: 'question', question, answers: [{ id: 'a', html: 'x' }], end: false }, true)
   assert.equal(plugin.pageOf('question:1').end, true, 'a load that adds nothing ends the list')
