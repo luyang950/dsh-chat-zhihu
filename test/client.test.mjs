@@ -438,7 +438,7 @@ test('guest script: reads the home feed with exact ids, skipping ads and cards w
     target: { kind: 'question', id: '2102992165089579738', answer: '2103000000000000001' },
     title: '如何评价这场比赛？',
     author: '甲',
-    excerpt: '甲：这场比赛 非常 精彩…',
+    excerpt: '这场比赛 非常 精彩…',
     votes: 1234,
   })
   assert.deepEqual(data.items[1].target, { kind: 'article', id: '42' })
@@ -497,6 +497,157 @@ test('feed entries merge without duplicates; a refreshed empty feed is an error,
   plugin.applyResult('feed', { kind: 'feed', items: [a, b] }, true)
   assert.equal(plugin.pageOf('feed').end, true)
   assert.ok(plugin.isList({ kind: 'feed' }) && plugin.isList({ kind: 'hot' }) && !plugin.isList({ kind: 'article', id: '1' }))
+})
+
+/* ── the API script ──────────────────────────────────────────────────────── */
+
+/** Run zhihuApi with a fake fetch. `routes` maps a URL prefix to [status, body]. */
+function runApi(plugin, op, routes) {
+  const calls = []
+  const fetch = async (url) => {
+    calls.push(url)
+    const hit = Object.keys(routes).find((prefix) => url.startsWith(prefix))
+    const [status, body] = hit ? routes[hit] : [404, { error: { message: 'not found' } }]
+    return { status, ok: status >= 200 && status < 300, json: async () => body }
+  }
+  const sandbox = { fetch, encodeURIComponent, Number, String, JSON, Promise }
+  return runInNewContext(`(${plugin.zhihuApi.toString()})(${JSON.stringify(op)})`, sandbox).then((result) => ({ result: plain(result), calls }))
+}
+
+const ANSWER = (id, qid, extra = {}) => ({
+  id,
+  type: 'answer',
+  content: `<p>正文 ${id}</p>`,
+  voteup_count: 12,
+  comment_count: 3,
+  created_time: 100,
+  excerpt: '摘<b>要</b>&amp;更多​',
+  author: { name: '甲', headline: '签名' },
+  question: { id: qid, title: '问题标题' },
+  ...extra,
+})
+
+test('API script: the feed keeps answers and articles with exact ids and full text', async () => {
+  const { plugin } = loadBundle()
+  const body = {
+    data: [
+      { target: ANSWER('2103070774898717119', '2102992165089579738') },
+      { target: { id: '707405801', type: 'article', title: '文章', content: '<p>文</p>', excerpt: 'e', voteup_count: 5, author: { name: '乙' } } },
+      { target: { id: '1', type: 'zvideo', title: '视频' } },
+      { target: { id: 'x', type: 'answer' } },
+      { type: 'feed_advert' },
+    ],
+    paging: { is_end: false, next: 'https://www.zhihu.com/api/v3/feed/topstory/recommend?page_number=2' },
+  }
+  const { result, calls } = await runApi(plugin, { kind: 'feed' }, { '/api/v3/feed/topstory/recommend': [200, body] })
+  assert.match(calls[0], /^\/api\/v3\/feed\/topstory\/recommend\?desktop=true/)
+  assert.equal(result.items.length, 2)
+  assert.deepEqual(result.items[0].target, { kind: 'question', id: '2102992165089579738', answer: '2103070774898717119' })
+  assert.equal(result.items[0].excerpt, '摘要&更多')
+  assert.equal(result.items[0].answer.html, '<p>正文 2103070774898717119</p>')
+  assert.deepEqual(result.items[1].target, { kind: 'article', id: '707405801' })
+  assert.equal(result.items[1].article.author, '乙')
+  assert.equal(result.next, 'https://www.zhihu.com/api/v3/feed/topstory/recommend?page_number=2')
+  assert.equal(result.end, false)
+})
+
+test('API script: paging only follows Zhihu API links; 401 is a login wall; other errors surface', async () => {
+  const { plugin } = loadBundle()
+  const evil = { data: [], paging: { is_end: false, next: 'https://evil.example.com/steal' } }
+  const { result } = await runApi(plugin, { kind: 'feed' }, { '/api/v3/': [200, evil] })
+  assert.equal(result.next, '')
+  assert.equal(result.end, true)
+  assert.deepEqual((await runApi(plugin, { kind: 'feed' }, { '/api/v3/': [401, { error: { message: 'x' } }] })).result, { blocked: true })
+  assert.deepEqual((await runApi(plugin, { kind: 'answer', id: '1' }, { '/api/v4/': [403, { error: { need_login: true } }] })).result, { blocked: true })
+  assert.deepEqual((await runApi(plugin, { kind: 'answers', id: '1' }, { '/api/v4/': [403, { error: { message: '请求参数异常' } }] })).result, {
+    error: '请求参数异常',
+  })
+  assert.deepEqual((await runApi(plugin, { kind: 'answers', id: '1/../x' }, {})).result, { error: '问题 id 不对' })
+})
+
+test("API script: a question's answers and a single answer", async () => {
+  const { plugin } = loadBundle()
+  const list = {
+    data: [ANSWER('11', '5'), ANSWER('12', '5')],
+    paging: { is_end: false, totals: 311, next: 'https://www.zhihu.com/api/v4/questions/5/answers?offset=10' },
+  }
+  const { result, calls } = await runApi(plugin, { kind: 'answers', id: '5' }, { '/api/v4/questions/5/answers': [200, list] })
+  assert.match(calls[0], /include=data%5B\*%5D\.content/)
+  assert.deepEqual(result.question, { id: '5', title: '问题标题', answerCount: 311 })
+  assert.deepEqual(
+    result.answers.map((answer) => [answer.id, answer.author, answer.votes]),
+    [
+      ['11', '甲', 12],
+      ['12', '甲', 12],
+    ],
+  )
+  const next = await runApi(plugin, { kind: 'answers', id: '5', next: list.paging.next }, { 'https://www.zhihu.com/api/v4/questions/5': [200, { data: [], paging: { is_end: true } }] })
+  assert.equal(next.calls[0], list.paging.next)
+  assert.equal(next.result.end, true)
+
+  const single = await runApi(plugin, { kind: 'answer', id: '11' }, { '/api/v4/answers/11': [200, ANSWER('11', '5')] })
+  assert.deepEqual(single.result.question, { id: '5', title: '问题标题', answerCount: null })
+  assert.equal(single.result.answer.html, '<p>正文 11</p>')
+})
+
+test('feed results seed their answer and article pages, so opening one needs no request', () => {
+  const { plugin } = loadBundle()
+  const answer = { id: '2', author: '甲', html: '<p>x</p>' }
+  const article = { id: '9', title: 'T', html: '<p>y</p>' }
+  plugin.applyResult(
+    'feed',
+    {
+      kind: 'feed',
+      next: 'https://www.zhihu.com/api/v3/next',
+      end: false,
+      items: [
+        { target: { kind: 'question', id: '1', answer: '2' }, title: 'Q', author: '甲', excerpt: 'e', votes: 1, question: { id: '1', title: 'Q' }, answer },
+        { target: { kind: 'article', id: '9' }, title: 'T', author: '乙', excerpt: 'f', votes: 2, article },
+      ],
+    },
+    false,
+  )
+  const feed = plugin.pageOf('feed')
+  assert.equal(feed.next, 'https://www.zhihu.com/api/v3/next')
+  assert.equal(feed.feed[0].answer, undefined, 'the list keeps no copy of the text')
+  const seeded = plugin.pageOf('question:1:2')
+  assert.equal(seeded.status, 'ready')
+  assert.equal(seeded.question.title, 'Q')
+  assert.equal(seeded.answers[0].html, '<p>x</p>')
+  assert.equal(seeded.listed, false)
+  assert.equal(plugin.pageOf('article:9').article.title, 'T')
+
+  // Scrolling past the seeded answer lists the question, keeping that answer first.
+  assert.deepEqual(plain(plugin.moreRequest({ kind: 'question', id: '1', answer: '2' }, seeded)), { kind: 'answers', id: '1' })
+  plugin.applyResult(
+    'question:1:2',
+    { kind: 'answers', question: { id: '1', title: '', answerCount: 3 }, answers: [{ id: '3', html: 'a' }, { id: '2', html: 'b' }], next: 'https://www.zhihu.com/api/v4/n', end: false },
+    true,
+  )
+  const listed = plugin.pageOf('question:1:2')
+  assert.deepEqual(plain(listed.answers.map((item) => item.id)), ['2', '3'])
+  assert.equal(listed.question.title, 'Q', 'the known title is kept')
+  assert.equal(listed.question.answerCount, 3)
+  assert.deepEqual(plain(plugin.moreRequest({ kind: 'question', id: '1', answer: '2' }, listed)), { kind: 'answers', id: '1', next: 'https://www.zhihu.com/api/v4/n' })
+})
+
+test('which request starts and continues each page, and when to read the page instead', () => {
+  const { plugin } = loadBundle()
+  assert.deepEqual(plain(plugin.firstRequest({ kind: 'feed' })), { kind: 'feed' })
+  assert.deepEqual(plain(plugin.firstRequest({ kind: 'question', id: '1' })), { kind: 'answers', id: '1' })
+  assert.deepEqual(plain(plugin.firstRequest({ kind: 'question', id: '1', answer: '2' })), { kind: 'answer', id: '2' })
+  assert.deepEqual(plain(plugin.firstRequest({ kind: 'answer', id: '2' })), { kind: 'answer', id: '2' })
+  assert.equal(plugin.firstRequest({ kind: 'article', id: '3' }), null, 'articles come from their page')
+
+  assert.equal(plugin.moreRequest({ kind: 'feed' }, { next: '' }), null)
+  assert.deepEqual(plain(plugin.moreRequest({ kind: 'question', id: '1' }, { source: 'page' })), { page: true })
+  assert.equal(plugin.moreRequest({ kind: 'question', id: '1' }, { listed: true, next: '', question: { id: '1' } }), null)
+
+  assert.equal(plugin.wantsPage({ error: '请求参数异常' }), true)
+  assert.equal(plugin.wantsPage({ blocked: true }), false, 'a login wall is shown, not worked around')
+  assert.equal(plugin.wantsPage({ kind: 'answers', answers: [], question: { title: '' } }), true, 'no answers, no title: read the page')
+  assert.equal(plugin.wantsPage({ kind: 'answers', answers: [{ id: '1' }], question: { title: 'Q' } }), false)
+  assert.throws(() => plugin.applyResult('x', { error: '知乎返回 HTTP 500' }, false), /HTTP 500/)
 })
 
 test('guest script: reads an article, refuses unknown pages, plants cookies', async () => {
