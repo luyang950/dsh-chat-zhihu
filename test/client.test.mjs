@@ -287,6 +287,60 @@ test('a stored navigation stack is restored, and junk falls back to the command 
   assert.deepEqual(plain(plugin.readNav('n2', { kind: 'article', id: '1' })), [{ target: { kind: 'article', id: '1' }, scroll: 0 }])
 })
 
+/* ── the card ────────────────────────────────────────────────────────────── */
+
+/** Every element in a REACT_STUB tree, depth first. */
+function walkTree(node, out = []) {
+  if (Array.isArray(node)) {
+    for (const child of node) walkTree(child, out)
+  } else if (node && typeof node === 'object' && 'type' in node) {
+    out.push(node)
+    walkTree(node.children, out)
+  }
+  return out
+}
+
+test('the card keeps the top of the text clear: one small pill in the corner, no header bar', () => {
+  const loaded = mount()
+  const { plugin } = loaded
+  const card = loaded.slots.find((slot) => slot.options.name === 'conversation.chat.node').component
+  plugin.shared.boss = false
+  plugin.shared.pages.set('hot', { status: 'ready', hot: [{ id: '1', title: '第一条', heat: '1 万热度' }] })
+  const tree = walkTree(card({ node: { key: 'n1', data: { status: 'ready', target: { kind: 'hot' } } } }))
+  const classes = tree.map((node) => (node.props && node.props.className) || '')
+  assert.ok(!classes.some((name) => /dczHead|dczChrome|dczBar/.test(name)), 'no bar over the text')
+  const stream = tree.find((node) => node.props && node.props.className === 'dczStream')
+  assert.equal(walkTree(stream.children)[0].props.className, 'dczHot', 'the first entry is the first thing in the stream')
+  const pill = tree.find((node) => node.props && node.props.className === 'dczPill')
+  assert.ok(pill, 'the pill exists')
+  assert.match(pill.props.title, /老板键/, 'the key hints moved into the tooltip')
+  const labels = walkTree(pill.children)
+    .filter((node) => node.type === 'button')
+    .map((node) => node.children.join(''))
+  assert.deepEqual(labels, ['推荐', '刷新', '合上'], 'only buttons that do something: no 返回 at the root, no 热榜 on the hot list')
+})
+
+test('a question card shows its position in the pill', () => {
+  const loaded = mount()
+  const { plugin } = loaded
+  const card = loaded.slots.find((slot) => slot.options.name === 'conversation.chat.node').component
+  plugin.shared.boss = false
+  plugin.shared.pages.set('question:5', {
+    status: 'ready',
+    question: { id: '5', title: 'Q', answerCount: 311 },
+    answers: [
+      { id: '1', author: '甲', html: '<p>一</p>' },
+      { id: '2', author: '乙', html: '<p>二</p>' },
+    ],
+  })
+  const tree = walkTree(card({ node: { key: 'n2', data: { status: 'ready', target: { kind: 'question', id: '5' } } } }))
+  const pill = tree.find((node) => node.props && node.props.className === 'dczPill')
+  const parts = walkTree(pill.children)
+  assert.equal(parts.find((node) => node.props && node.props.className === 'dczPos').children.join(''), '1/311')
+  const labels = parts.filter((node) => node.type === 'button').map((node) => node.children.join(''))
+  assert.deepEqual(labels, ['推荐', '热榜', '下一个', '刷新', '合上'])
+})
+
 /* ── boss key ────────────────────────────────────────────────────────────── */
 
 test('the boss key toggles only with a card on screen, and only on the exact chord', () => {
