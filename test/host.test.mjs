@@ -7,7 +7,16 @@ import { join } from 'node:path'
 import test, { before } from 'node:test'
 
 import { API_PREFIX, apply, handleApi, inject, zhihuCommand } from '../index.mjs'
-import { dataDirectory, normalizeChord, parseCookie, readConfig, readCookie, validateConfigPatch, writeCookie } from '../lib/store.mjs'
+import {
+  dataDirectory,
+  normalizeChord,
+  parseCookie,
+  readConfig,
+  readCookie,
+  validateConfigPatch,
+  writeConfig,
+  writeCookie,
+} from '../lib/store.mjs'
 import { clearHotCache, hotList, isTarget, parseHotList, parseTarget, targetUrl } from '../lib/zhihu.mjs'
 import { fakeRequest, fakeResponse, tempDir } from './helpers.mjs'
 
@@ -43,8 +52,11 @@ const HOT_PAYLOAD = {
 /* ── links ───────────────────────────────────────────────────────────────── */
 
 test('parseTarget understands Zhihu links and short forms', () => {
-  assert.deepEqual(parseTarget(''), { kind: 'hot' })
+  assert.deepEqual(parseTarget(''), { kind: 'feed' }, 'a bare /zhihu opens the feed by default')
+  assert.deepEqual(parseTarget('', 'hot'), { kind: 'hot' })
   assert.deepEqual(parseTarget('热榜'), { kind: 'hot' })
+  assert.deepEqual(parseTarget('推荐'), { kind: 'feed' })
+  assert.deepEqual(parseTarget('feed'), { kind: 'feed' })
   assert.deepEqual(parseTarget('https://www.zhihu.com/question/123'), { kind: 'question', id: '123' })
   assert.deepEqual(parseTarget('https://www.zhihu.com/question/123/'), { kind: 'question', id: '123' })
   assert.deepEqual(parseTarget('www.zhihu.com/question/123/answer/456?utm_psn=1'), { kind: 'question', id: '123', answer: '456' })
@@ -70,6 +82,8 @@ test('parseTarget refuses everything that is not a Zhihu question, answer or art
 
 test('isTarget and targetUrl agree on the shapes', () => {
   assert.ok(isTarget({ kind: 'hot' }))
+  assert.ok(isTarget({ kind: 'feed' }))
+  assert.equal(targetUrl({ kind: 'feed' }), 'https://www.zhihu.com/')
   assert.ok(isTarget({ kind: 'question', id: '1', answer: '2' }))
   assert.ok(!isTarget({ kind: 'answer', id: '1', answer: '2' }))
   assert.ok(!isTarget({ kind: 'question', id: '1; drop' }))
@@ -84,6 +98,8 @@ test('config validation clamps numbers and refuses bad values', async () => {
   assert.deepEqual(validateConfigPatch({ fontSize: 99, lineHeight: 0.5 }).value, { fontSize: 28, lineHeight: 1.2 })
   assert.ok(validateConfigPatch({ libraryRoot: '/x' }).errors.length > 0)
   assert.ok(validateConfigPatch({ showImages: 'yes' }).errors.length > 0)
+  assert.ok(validateConfigPatch({ defaultView: 'question' }).errors.length > 0)
+  assert.deepEqual(validateConfigPatch({ defaultView: 'hot' }).value, { defaultView: 'hot' })
   assert.equal(normalizeChord('ctrl+alt+KeyZ'), 'Ctrl+Alt+KeyZ')
   assert.equal(normalizeChord('KeyZ'), null)
   assert.equal(normalizeChord('Shift+KeyZ'), null)
@@ -191,12 +207,18 @@ test('/zhihu settles with the target only', async () => {
   const result = await command.handler({ rawInput: '/zhihu https://www.zhihu.com/question/9/answer/10' })
   assert.equal(result.kind, 'success')
   assert.deepEqual(JSON.parse(result.text), { target: { kind: 'question', id: '9', answer: '10' } })
+  const bare = await command.handler({ rawInput: '/zhihu' })
+  assert.deepEqual(JSON.parse(bare.text), { target: { kind: 'feed' } }, 'the feed is the default')
+  await writeConfig({ defaultView: 'hot' })
   const hot = await command.handler({ rawInput: '/zhihu' })
-  assert.deepEqual(JSON.parse(hot.text), { target: { kind: 'hot' } })
+  assert.deepEqual(JSON.parse(hot.text), { target: { kind: 'hot' } }, 'a bare /zhihu follows the setting')
+  const feed = await command.handler({ rawInput: '/zhihu 推荐' })
+  assert.deepEqual(JSON.parse(feed.text), { target: { kind: 'feed' } })
+  await writeConfig({ defaultView: 'feed' })
   const bad = await command.handler({ rawInput: '/zhihu https://example.com' })
   assert.equal(bad.kind, 'error')
   await new Promise((resolve) => setImmediate(resolve))
-  assert.equal(opened.length, 2, 'afterOpen runs only for successful opens')
+  assert.equal(opened.length, 4, 'afterOpen runs only for successful opens')
 })
 
 test('apply registers the command, the pre-step guard and the api', () => {

@@ -76,13 +76,14 @@ export const COMMAND = 'zhihu'
 export function zhihuCommand(hooks = {}) {
   return {
     name: COMMAND,
-    description: '在会话里看知乎（热榜 / 问题 / 回答 / 专栏），内容不进模型上下文',
-    input: { hint: '<留空看热榜，或贴知乎链接>' },
+    description: '在会话里看知乎（推荐 / 热榜 / 问题 / 回答 / 专栏），内容不进模型上下文',
+    input: { hint: '<留空看推荐；热榜；或贴知乎链接>' },
     recordInput: true,
     async handler(invocation) {
       const argument = String(invocation?.rawInput ?? '').replace(/^\/zhihu\b/, '').trim()
       try {
-        const target = parseTarget(argument)
+        const fallback = argument ? 'feed' : (await readConfig()).defaultView
+        const target = parseTarget(argument, fallback)
         if (typeof hooks.afterOpen === 'function') setImmediate(() => hooks.afterOpen(invocation, target))
         return { kind: 'success', text: JSON.stringify({ target }) }
       } catch (error) {

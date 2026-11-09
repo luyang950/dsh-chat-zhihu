@@ -6,9 +6,9 @@
 
 ## 中文
 
-在 DeepSeek Harness（DSH）的**会话流里**摸鱼看知乎。输入 `/zhihu`，热榜就出现在你敲命令的那一轮，长得像一条普通的 AI 回复；点进问题就在卡片里往下读回答。内容**不进模型上下文、不产生任何 token**。
+在 DeepSeek Harness（DSH）的**会话流里**摸鱼看知乎。输入 `/zhihu`，推荐列表就出现在你敲命令的那一轮，长得像一条普通的 AI 回复；点一条就在卡片里读回答，滚到底自动加载更多。内容**不进模型上下文、不产生任何 token**。
 
-适配 DSH `>=0.2.1-0 <0.3.0-0`。看热榜 Web 版和桌面版都行；**看问题、回答、专栏需要桌面版**（见下文「原理」）。
+适配 DSH `>=0.2.1-0 <0.3.0-0`。看热榜 Web 版和桌面版都行；**推荐、问题、回答、专栏需要桌面版并登录知乎**（见下文「原理」）。
 
 ### 特性
 
@@ -18,13 +18,15 @@
 - **零 token**：`/zhihu` 只产生两条只写日志的事件（`command/run` / `command/done`），结果只是一个目标（热榜 / 问题 id / 回答 id / 文章 id），不伪造 assistant 消息。
 - **不顶动历史**：卡片高度 = 会话可视高度 − 输入框高度，内容在卡片内部滚动，往下滚到底自动加载更多回答。
 - **老板键**（默认 `Ctrl + Alt + Z`，可在设置里改；和 dsh-chat-reader 的 `Ctrl + Alt + B` 不冲突）：按一次所有知乎卡片折叠成一行 `···`，内容**从 DOM 移除**，后台的知乎网页也一并关掉；再按恢复。刷新后保持。
-- **卡片内导航**：热榜 → 问题 → 返回，每层的滚动位置都记得；刷新页面后回到原处。
+- **推荐列表**：和知乎首页「推荐」一样的内容，每条显示标题、作者、赞同数和两行摘要；滚到底自动加载更多，「刷新」换一批。广告、想法、视频跳过。
+- **卡片内导航**：推荐 / 热榜 → 回答 → 返回，每层的滚动位置都记得；刷新页面后回到原处。底栏可在推荐和热榜之间切换。
 - **会话常驻侧边栏**：和 dsh-chat-reader 一样，在新会话里 `/zhihu` 后跑一个不调用模型的空轮次，让会话留在侧边栏；会话标题默认是「资料整理」（可改）。
 
 ### 用法
 
 ```
-/zhihu                                              # 热榜
+/zhihu                                              # 推荐（默认，可在设置里改成热榜）
+/zhihu 推荐 · /zhihu 热榜                           # 指定打开哪个
 /zhihu https://www.zhihu.com/question/123456        # 问题
 /zhihu https://www.zhihu.com/question/123/answer/456 # 从某个回答开始读
 /zhihu https://zhuanlan.zhihu.com/p/789             # 专栏文章
@@ -55,18 +57,19 @@
 ### 原理
 
 - **热榜**由插件宿主侧请求知乎的公开热榜接口（不需要登录），缓存 1 分钟。
+- **推荐**：隐藏网页打开知乎首页，读出每张推荐卡片的链接（问题 / 回答 / 文章 id 都从链接文本里取，不经过数字，避免 19 位 id 丢精度）、标题、作者、赞同和摘要；加载更多就是让隐藏网页滚到底。
 - **问题 / 回答 / 专栏**：知乎对这些接口有登录墙和签名校验。插件不去破解签名，而是在 DSH 桌面版里通过 `window.dshDesktop.browser`（DSH 自带侧栏浏览器用的同一个桥）租用一个**隐藏的 `<webview>`**，在里面正常打开知乎页面，读取页面自带的数据（`js-initialData`）和 DOM，然后把正文 HTML **转换成纯文本段落**再显示——知乎的 HTML 从不插进 DSH 页面。往下滚时，插件让隐藏网页滚到底，知乎自己加载更多回答。
 - 隐藏网页运行在 DSH 的沙箱分区里（无 Node、contextIsolation、禁权限请求），和 DSH 自带浏览器的隔离策略一致。
 
 ### 设置
 
-设置 → **知乎**：cookie、字号（默认跟随会话）、行距、显示图片（默认关）、老板键、常驻侧边栏、会话标题。
+设置 → **知乎**：cookie、`/zhihu` 默认打开推荐还是热榜、字号（默认跟随会话）、行距、显示图片（默认关）、老板键、常驻侧边栏、会话标题。
 
 ### 安装
 
 **桌面版：** 打开左侧 **Plugins** 页，用 GitHub spec 安装 `github:luyang950/dsh-chat-zhihu`，按提示重启。
 
-**命令行（Web 版 profile，只能看热榜）：**
+**命令行（Web 版 profile，只能看热榜，用 `/zhihu 热榜`）：**
 
 ```bash
 dsh plugin --profile web add github:luyang950/dsh-chat-zhihu
@@ -113,10 +116,10 @@ cordis.patch.yml
 
 ## English
 
-Read Zhihu **inside the DeepSeek Harness conversation transcript**, disguised as an ordinary reply. `/zhihu` shows the hot list where you typed it; open a question and read its answers inside the card. Nothing enters the model context; zero tokens.
+Read Zhihu **inside the DeepSeek Harness conversation transcript**, disguised as an ordinary reply. `/zhihu` shows your recommended feed (or the hot list) where you typed it; open an entry and read its answers inside the card. Nothing enters the model context; zero tokens.
 
 - **Hot list** works on Web and Desktop (fetched by the host from Zhihu's public endpoint).
-- **Questions, answers and articles need DSH Desktop**: Zhihu shows them only to a signed-in browser, so the card leases one hidden `<webview>` through `window.dshDesktop.browser` (the bridge DSH's own sidebar browser uses), opens the page there and reads the page's own data. Zhihu's HTML is converted to plain text blocks by a small parser and never injected.
+- **The feed, questions, answers and articles need DSH Desktop**: Zhihu shows them only to a signed-in browser, so the card leases one hidden `<webview>` through `window.dshDesktop.browser` (the bridge DSH's own sidebar browser uses), opens the page there and reads the page's own data. Zhihu's HTML is converted to plain text blocks by a small parser and never injected.
 - **Sign in** inside the card (QR code; lasts until the app quits) or paste your Zhihu cookie (with `z_c0`) in Settings → 知乎 so it survives restarts. The cookie is stored only in `$DSH_HOME/dsh-chat-zhihu/cookie.json` (mode 600).
 - **Boss key** `Ctrl + Alt + Z` (configurable) folds every card to `···`, removes the text from the DOM and closes the hidden webview.
 - Images are off by default; settings: font size, line height, images, boss key, keep-in-sidebar, session title.
@@ -124,7 +127,8 @@ Read Zhihu **inside the DeepSeek Harness conversation transcript**, disguised as
 Install on Desktop: **Plugins** → GitHub spec `github:luyang950/dsh-chat-zhihu`, then restart.
 
 ```
-/zhihu                                    # hot list
+/zhihu                                    # recommended feed (default; configurable)
+/zhihu 热榜                               # hot list
 /zhihu <question / answer / article link> # or 123 · a456 · p789
 ```
 

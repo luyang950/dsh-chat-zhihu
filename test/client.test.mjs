@@ -314,14 +314,37 @@ test('the boss key toggles only with a card on screen, and only on the exact cho
 
 /* ── the guest script ────────────────────────────────────────────────────── */
 
-function runGuest(plugin, op, { pathname, hostname = 'www.zhihu.com', state, readyState = 'complete' }) {
+/** A tiny element stand-in: `find` maps a selector to a child element (or null). */
+function element({ className = '', attrs = {}, text = '', find = {} } = {}) {
+  return {
+    className,
+    textContent: text,
+    getAttribute: (name) => (name in attrs ? attrs[name] : null),
+    querySelector: (selector) => find[selector] || null,
+  }
+}
+
+/** A home-feed card the way Zhihu renders one. */
+function feedCard({ href, title, zop, votes, excerpt, className = 'Card TopstoryItem' }) {
+  const content = element({
+    attrs: { 'data-zop': JSON.stringify(zop) },
+    find: {
+      'meta[itemprop="upvoteCount"]': votes === undefined ? null : element({ attrs: { content: String(votes) } }),
+      '.RichContent-inner': element({ text: excerpt }),
+    },
+  })
+  const link = element({ attrs: { href }, text: title })
+  return element({ className, find: { '.ContentItem': content, '.ContentItem-title a[href]': link } })
+}
+
+function runGuest(plugin, op, { pathname, hostname = 'www.zhihu.com', state, readyState = 'complete', cards = [] }) {
   const cookies = []
   const document = {
     readyState,
     title: 't',
     getElementById: (id) => (id === 'js-initialData' && state ? { textContent: JSON.stringify({ initialState: state }) } : null),
-    querySelector: () => null,
-    querySelectorAll: () => [],
+    querySelector: (selector) => (cards.length > 0 && /TopstoryItem|Feed/.test(selector) ? cards[0] : null),
+    querySelectorAll: (selector) => (selector === '.TopstoryItem' ? cards : []),
     documentElement: { scrollHeight: 0 },
     set cookie(value) {
       cookies.push(value)
@@ -340,6 +363,7 @@ function runGuest(plugin, op, { pathname, hostname = 'www.zhihu.com', state, rea
     Date,
     Promise,
     Set,
+    RegExp,
   }
   const result = runInNewContext(`(${plugin.zhihuGuest.toString()})(${JSON.stringify(op)})`, sandbox)
   return { result, cookies }
@@ -378,6 +402,60 @@ test('guest script: reads a question from the page data alone', async () => {
     ],
   )
   assert.equal(data.end, true)
+})
+
+test('guest script: reads the home feed with exact ids, skipping ads and cards without a link', async () => {
+  const { plugin } = loadBundle()
+  const cards = [
+    feedCard({
+      href: '//www.zhihu.com/question/2102992165089579738/answer/2103000000000000001',
+      title: '  如何评价这场比赛？ ',
+      zop: { authorName: '甲', itemId: 2103000000000000001, type: 'answer' },
+      votes: 1234,
+      excerpt: '甲：这场比赛 非常\n精彩…  阅读全文 ',
+    }),
+    feedCard({ href: 'https://zhuanlan.zhihu.com/p/42', title: '一篇文章', zop: { authorName: '乙' }, excerpt: 'x'.repeat(300) }),
+    feedCard({ href: '//www.zhihu.com/question/7', title: '广告', zop: {}, excerpt: '', className: 'Card TopstoryItem TopstoryItem--advertCard' }),
+    feedCard({ href: '//www.zhihu.com/pin/9', title: '想法', zop: {}, excerpt: '' }),
+    feedCard({
+      href: '//www.zhihu.com/question/2102992165089579738/answer/2103000000000000001',
+      title: '重复',
+      zop: {},
+      excerpt: '',
+    }),
+  ]
+  const data = plain(await runGuest(plugin, { action: 'extract' }, { pathname: '/', cards }).result)
+  assert.equal(data.kind, 'feed')
+  assert.equal(data.items.length, 2)
+  assert.deepEqual(data.items[0], {
+    target: { kind: 'question', id: '2102992165089579738', answer: '2103000000000000001' },
+    title: '如何评价这场比赛？',
+    author: '甲',
+    excerpt: '甲：这场比赛 非常 精彩…',
+    votes: 1234,
+  })
+  assert.deepEqual(data.items[1].target, { kind: 'article', id: '42' })
+  assert.equal(data.items[1].excerpt.length, 160)
+  assert.equal(data.items[1].votes, null)
+})
+
+test('feed entries merge without duplicates; a refreshed empty feed is an error, a stalled one ends', () => {
+  const { plugin } = loadBundle()
+  const a = { target: { kind: 'question', id: '1', answer: '2' }, title: 'A' }
+  const b = { target: { kind: 'article', id: '3' }, title: 'B' }
+  const merged = plugin.mergeFeed([a], [a, b, { target: { kind: 'hot' } }, { target: { kind: 'people', id: 'x' } }])
+  assert.deepEqual(plain(merged).map((item) => item.title), ['A', 'B'])
+
+  assert.throws(() => plugin.applyResult('feed', { kind: 'feed', items: [] }, false), /空的/)
+  plugin.applyResult('feed', { kind: 'feed', items: [a] }, false)
+  assert.equal(plugin.pageOf('feed').status, 'ready')
+  assert.equal(plugin.pageOf('feed').end, false)
+  plugin.applyResult('feed', { kind: 'feed', items: [a, b] }, true)
+  assert.equal(plugin.pageOf('feed').feed.length, 2)
+  assert.equal(plugin.pageOf('feed').end, false)
+  plugin.applyResult('feed', { kind: 'feed', items: [a, b] }, true)
+  assert.equal(plugin.pageOf('feed').end, true)
+  assert.ok(plugin.isList({ kind: 'feed' }) && plugin.isList({ kind: 'hot' }) && !plugin.isList({ kind: 'article', id: '1' }))
 })
 
 test('guest script: reads an article, refuses unknown pages, plants cookies', async () => {
